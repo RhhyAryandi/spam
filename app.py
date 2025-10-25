@@ -1,14 +1,17 @@
 from flask import Flask, request, jsonify
-import requests
 import json
 import threading
 import time
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import uuid
+import asyncio
+import aiohttp
 from byte import Encrypt_ID, encrypt_api
 
 app = Flask(__name__)
+
+# menyimpan status job di memory (untuk prototipe). Untuk produksi gunakan DB/redis.
+jobs = {}
 
 def load_tokens():
     try:
@@ -20,17 +23,11 @@ def load_tokens():
         print(f"Error loading tokens: {e}")
         return []
 
-def send_friend_request(uid, token, session, retries=2, backoff_factor=0.5):
-    """
-    Mengirim satu request untuk token tertentu. Mengembalikan True jika sukses, False jika gagal.
-    retries: jumlah retry setelah kegagalan
-    backoff_factor: faktor untuk exponential backoff (detik)
-    """
+async def send_single(session, uid, token, retries=2, backoff_factor=0.5, timeout=10):
     try:
         encrypted_id = Encrypt_ID(uid)
         payload = f"08a7c4839f1e10{encrypted_id}1801"
         encrypted_payload = encrypt_api(payload)
-
         url = "https://clientbp.ggwhitehawk.com/RequestAddingFriend"
         headers = {
             "Expect": "100-continue",
@@ -49,31 +46,74 @@ def send_friend_request(uid, token, session, retries=2, backoff_factor=0.5):
         attempt = 0
         while attempt <= retries:
             try:
-                # gunakan session.post dengan timeout
-                response = session.post(url, headers=headers, data=bytes.fromhex(encrypted_payload), timeout=10)
-                if response.status_code == 200:
-                    return True
-                else:
-                    # bisa log detail jika perlu
-                    # print(f"Token {token[:6]}... status {response.status_code}")
-                    attempt += 1
-                    if attempt <= retries:
-                        sleep_time = backoff_factor * (2 ** (attempt - 1))
-                        time.sleep(sleep_time)
-            except requests.RequestException as e:
+                async with session.post(url, headers=headers, data=bytes.fromhex(encrypted_payload), timeout=timeout) as resp:
+                    status = resp.status
+                    if status == 200:
+                        return True
+                    else:
+                        attempt += 1
+                        if attempt <= retries:
+                            await asyncio.sleep(backoff_factor * (2 ** (attempt - 1)))
+            except asyncio.TimeoutError:
                 attempt += 1
                 if attempt <= retries:
-                    sleep_time = backoff_factor * (2 ** (attempt - 1))
-                    time.sleep(sleep_time)
+                    await asyncio.sleep(backoff_factor * (2 ** (attempt - 1)))
                 else:
-                    # final failure
                     return False
-
         return False
     except Exception as e:
-        # jika Encrypt_ID / encrypt_api error
-        print(f"Error sending for token {token[:6]}... : {e}")
+        # Encrypt_ID / encrypt_api error
         return False
+
+async def run_job_async(job_id, uid, tokens, delay, jitter, concurrency, retries, backoff):
+    jobs[job_id]["status"] = "running"
+    jobs[job_id]["started_at"] = time.time()
+    success = 0
+    failed = 0
+    total = len(tokens)
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def sem_task(session, token, index):
+        # optional stagger per task: kecil, tidak blocking keseluruhan
+        # tapi jangan gunakan asyncio.sleep besar di sini jika ingin cepat
+        # kita gunakan a tiny jitter
+        await asyncio.sleep(max(0, random.uniform(-jitter, jitter)))
+        async with semaphore:
+            ok = await send_single(session, uid, token, retries=retries, backoff_factor=backoff)
+            return ok
+
+    connector = aiohttp.TCPConnector(limit=0)  # no per-host limit here; concurrency controlled by semaphore
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        tasks = []
+        for i, token in enumerate(tokens):
+            # optional small spacing before scheduling task to keep CPU/memory friendly
+            # but we DO NOT block the request thread here; it's within the background coroutine
+            tasks.append(asyncio.create_task(sem_task(session, token, i)))
+            # if you want to pace submission (very small), you can: await asyncio.sleep(delay + random.uniform(-jitter,jitter))
+            # but to maximize throughput, don't add large sleeps here.
+
+        for coro in asyncio.as_completed(tasks):
+            ok = await coro
+            if ok:
+                success += 1
+            else:
+                failed += 1
+            # update job progress
+            jobs[job_id]["success"] = success
+            jobs[job_id]["failed"] = failed
+            jobs[job_id]["progress"] = (success + failed) / total
+
+    jobs[job_id]["status"] = "done"
+    jobs[job_id]["finished_at"] = time.time()
+    jobs[job_id]["success"] = success
+    jobs[job_id]["failed"] = failed
+    jobs[job_id]["progress"] = 1.0
+
+def run_job_in_thread(job_id, uid, tokens, delay, jitter, concurrency, retries, backoff):
+    # wrapper untuk menjalankan asyncio event loop di thread background
+    asyncio.run(run_job_async(job_id, uid, tokens, delay, jitter, concurrency, retries, backoff))
 
 @app.route("/send_requests", methods=["GET"])
 def send_requests():
@@ -81,14 +121,14 @@ def send_requests():
     if not uid:
         return jsonify({"error": "uid parameter is required"}), 400
 
-    # optional params with defaults
     try:
-        delay = float(request.args.get("delay", 0.2))       # rata-rata jeda (detik) antar start task
-        jitter = float(request.args.get("jitter", 0.05))    # variasi +/- (detik)
-        max_workers = int(request.args.get("max_workers", 5))  # concurrency
-        limit = int(request.args.get("limit", 110))         # token limit
-        retries = int(request.args.get("retries", 2))       # retry per request
-        backoff = float(request.args.get("backoff", 0.5))   # backoff factor (detik)
+        # params (defaults)
+        delay = float(request.args.get("delay", 0.0))       # kita set 0.0 default; jika ingin pacing set >0
+        jitter = float(request.args.get("jitter", 0.01))
+        concurrency = int(request.args.get("concurrency", 50))  # gunakan concurrency tinggi jika server tujuan sanggup
+        limit = int(request.args.get("limit", 110))
+        retries = int(request.args.get("retries", 2))
+        backoff = float(request.args.get("backoff", 0.5))
     except ValueError:
         return jsonify({"error": "Invalid numeric parameter"}), 400
 
@@ -98,42 +138,33 @@ def send_requests():
 
     tokens = tokens[:max(0, min(limit, len(tokens)))]
 
-    results = {"success": 0, "failed": 0}
-    futures = []
+    # buat job id dan simpan job meta
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "queued",
+        "uid": uid,
+        "total": len(tokens),
+        "success": 0,
+        "failed": 0,
+        "progress": 0.0,
+        "created_at": time.time()
+    }
 
-    # gunakan satu session per worker untuk efisiensi
-    session = requests.Session()
+    # start thread background (return HTTP cepat)
+    t = threading.Thread(target=run_job_in_thread, args=(job_id, uid, tokens, delay, jitter, concurrency, retries, backoff), daemon=True)
+    t.start()
 
-    # ThreadPoolExecutor mengatur concurrency
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for token in tokens:
-            # sebelum submit, tunggu delay dengan jitter agar tidak semua start bersamaan
-            actual_delay = max(0, delay + random.uniform(-jitter, jitter))
-            time.sleep(actual_delay)
+    return jsonify({"job_id": job_id, "status_url": f"/status?job_id={job_id}"}), 202
 
-            # submit job (jangan lupa untuk mengirim parameter retry/backoff)
-            futures.append(executor.submit(send_friend_request, uid, token, session, retries, backoff))
-
-        # tunggu semua selesai dan kumpulkan hasil
-        for future in as_completed(futures):
-            try:
-                ok = future.result()
-                if ok:
-                    results["success"] += 1
-                else:
-                    results["failed"] += 1
-            except Exception as e:
-                results["failed"] += 1
-
-    session.close()
-
-    status = 1 if results["success"] != 0 else 2
-
-    return jsonify({
-        "success_count": results["success"],
-        "failed_count": results["failed"],
-        "status": status
-    })
+@app.route("/status", methods=["GET"])
+def status():
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return jsonify({"error": "job_id parameter required"}), 400
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(job)
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
