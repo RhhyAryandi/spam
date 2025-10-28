@@ -52,7 +52,7 @@ def send_requests():
 
     tokens = load_tokens()
     if not tokens:
-        return jsonify({"error": "No tokens found in spam_ind.json"}), 500
+        return jsonify({"error": "No tokens found in token_bd.json"}), 500
 
     results = {"success": 0, "failed": 0}
     threads = []
