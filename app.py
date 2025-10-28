@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import requests
 import json
 import threading
+import time
 from byte import Encrypt_ID, encrypt_api
 
 app = Flask(__name__)
@@ -55,17 +56,11 @@ def send_requests():
         return jsonify({"error": "No tokens found in token_bd.json"}), 500
 
     results = {"success": 0, "failed": 0}
-    threads = []
 
     for token in tokens[:110]:
-        thread = threading.Thread(target=send_friend_request, args=(uid, token, results))
-        threads.append(thread)
-        thread.start()
+        send_friend_request(uid, token, results)
+        time.sleep(1)  # jeda 1 detik antar request
 
-    for thread in threads:
-        thread.join()
-
-    total_requests = results["success"] + results["failed"]
     status = 1 if results["success"] != 0 else 2
 
     return jsonify({
