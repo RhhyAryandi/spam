@@ -15,7 +15,7 @@ jobs = {}
 
 def load_tokens():
     try:
-        with open("spam_ind.json", "r") as file:
+        with open("token_bd.json", "r") as file:
             data = json.load(file)
         tokens = [item["token"] for item in data]
         return tokens
